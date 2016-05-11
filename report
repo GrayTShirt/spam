@@ -1,0 +1,110 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use Sys::Mmap;
+use Time::Local;
+use DBI;
+
+
+use Inline C => <<'END', ccflags => '-O3 -march=native -pipe', libs => '-lmaxminddb';
+#include <maxminddb.h>
+
+
+MMDB_s mmdb;
+
+int open_db(char *db)
+{
+	if ((MMDB_open(db,  MMDB_MODE_MMAP, &mmdb)) != MMDB_SUCCESS)
+		return 0;
+	else
+		return 1;
+}
+
+char * lookup(char *ip)
+{
+
+	int gai_error, mmdb_error;
+	MMDB_lookup_result_s result = MMDB_lookup_string(&mmdb, ip, &gai_error, &mmdb_error);
+	if (mmdb_error != MMDB_SUCCESS)
+		return "failed to lookup ip";
+	if (0 != gai_error)
+		return "ip error";
+	if (!result.found_entry)
+		return "ip not found";
+
+	MMDB_entry_data_s *entry_data = malloc(sizeof(MMDB_entry_data_s));
+	int status = MMDB_get_value(&result.entry, entry_data,
+		"country", "names", "en", NULL);
+
+	if (status != MMDB_SUCCESS)
+		return "failed to lookup entry";
+	if (!entry_data->has_data)
+		return "country not found in entry";
+	if (entry_data->type != MMDB_DATA_TYPE_UTF8_STRING)
+		return "entry data not string";
+
+	char *string = malloc(entry_data->data_size);
+	for (int i = 0; i < entry_data->data_size; i++)
+		string[i] = entry_data->utf8_string[i];
+	string[entry_data->data_size] = '\0';
+
+	return string;
+}
+
+int close_db()
+{
+	MMDB_close(&mmdb);
+	return 1;
+}
+
+END
+
+
+unlink 'spam.db' if -f 'spam.db';
+my $dbh = DBI->connect("dbi:SQLite:dbname=spam.db", "", "", { RaiseError => 1 }) or die "failed to connect to spam.db: ".$DBI::errstr;
+$dbh->do("CREATE TABLE spam (id INTEGER PRIMARY KEY AUTOINCREMENT, ip TEXT, host TEXT, received TIMESTAMP DEFAULT (strftime('%s', 'now')), country TEXT, email_from TEXT, email_to TEXT, reason_id TEXT, reason TEXT);") or die "failed to create spam table: ".$dbh->errstr;
+$dbh->do("PRAGMA synchronous = OFF;") or die "failed to turn off synchronous pragma: ".$dbh->errstr;
+$dbh->do("PRAGMA journal_mode = MEMORY;") or die "failed to set journal pragma to memory: ".$dbh->errstr;
+$dbh->do("PRAGMA threads = 128;") or die "failed to set auxillary thread limit: ".$dbh->errstr;
+my $sth = $dbh->prepare("INSERT INTO spam (ip, host, received, country, email_from, email_to, reason_id, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+$dbh->begin_work or die "failed to begin bulk import: ".$dbh->errstr;;
+
+my $log_file = '/var/log/spam.log';
+my $year = 2016;
+my %months = (Jan => 0, Feb => 1, Mar => 2, Apr => 3, May => 4, Jun => 5, Jul => 6, Aug => 7, Sep => 8, Oct => 9, Nov => 10, Dec => 11);
+open_db "/var/lib/geoip/GeoLite2-City.mmdb" || die "unable to open /var/lib/geoip/GeoLite2-City.mmdb";
+my ($epoch, $host, $ip, $reason_id, $reason, $from, $to, $country);
+my (@ts, @day);
+open my $fh, '<', $log_file or die "unable to open spam file: $log_file: $!";
+mmap my $map, (stat $log_file)[7], PROT_READ, MAP_SHARED, $fh or die "failed to map: $log_file, $!";
+for (split '\n', $map) {
+	if ($_ =~ m/^(.*) \S+ postfix\/smtpd.*RCPT from (.*)\[(.*)\]:\s*(\d+\s+\d+\.\d+\.\d+)\s+(.*);\s+from=<(.*)> to=<(.*@.*)> proto.*$/) {
+		($epoch, $host, $ip, $reason_id, $reason, $from, $to) = ($1, $2, $3, $4, $5, $6, $7);
+		$country = lookup $ip;
+		for (split '\n', $country) {
+			if ($country =~ m/.*"(.*)".*/) {
+				$country = $1;
+			}
+		}
+		if ($epoch =~ m/\d\d:\d\d$/) {
+			@ts  = split ' ', $epoch;
+			@day = split ':', $ts[2];
+			$epoch = timelocal $day[2], $day[1], $day[0], $ts[1], $months{$ts[0]}, $year - 1900;
+		}
+		#else {
+		#	$epoch += 86400;
+		#}
+		$sth->execute($ip, $host, $epoch, $country, $from, $to, $reason_id, $reason);
+	} else {
+		print "$_\n";
+	}
+}
+munmap $map or die "failed to close map: $log_file: $!";
+close $fh or die "failed to close file: $log_file: $!";
+close_db;
+$dbh->commit or die "failed to commit bulk import: ".$dbh->errstr;
+$dbh->do("CREATE INDEX _all_i ON SPAM(ip,host,received,country,email_from,email_to,reason_id);")
+	or die "failed to create _all_i index: ".$dbh->errstr;
+$dbh->disconnect or die "failed to disconnect from spam.db: ".$dbh->errstr;
